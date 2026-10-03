@@ -1,0 +1,8 @@
+venv/
+.env
+bench.db
+bench.db-wal
+bench.db-shm
+test_bench.db*
+__pycache__/
+*.pyc

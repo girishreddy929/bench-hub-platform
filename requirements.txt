@@ -1,0 +1,9 @@
+streamlit>=1.37
+sqlmodel
+pdfplumber
+python-docx
+ollama>=0.4
+python-dotenv
+pandas
+python-pptx
+sqlite-vec
