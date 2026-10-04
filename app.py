@@ -1,9 +1,9 @@
 import os
 from urllib.parse import quote
-
+import re
 import pandas as pd
 import streamlit as st
-
+import html
 import src.ai.ai_engine as ai
 from src.ai import models
 import src.db.database as db
@@ -12,14 +12,13 @@ import src.ui.ui_theme as ui_theme
 import streamlit.components.v1 as components
 from src.services import jobs
 from src.ui.import_ui import render_import_section
-from src.search.skills import compact_skill, merge_skills
+from src.search.skills import compact_skill, merge_skills, normalize_skill
 
 APP_TITLE = "Tredence Bench Hub"  # rename the app here
 
 st.set_page_config(page_title=APP_TITLE, page_icon=ui_theme.page_icon(), layout="wide")
 
 MAX_UPLOAD_MB = 10
-SUMMARY_ON_FEEDBACK = os.getenv("SUMMARY_ON_FEEDBACK", "false").strip().lower() == "true"
 
 RESUME_TYPES = ["pdf", "docx"]
 SLIDER_TYPES = ["pptx", "docx", "pdf"]
@@ -86,27 +85,8 @@ def _noop() -> None:
     pass
 
 def refresh_summary(employee_id: int) -> bool:
-    """Regenerate and save the AI summary. Never raises; queues a message."""
-    docs = db.get_documents(employee_id)
-    feedback = db.get_feedback(employee_id)
-    resume, slider = docs.get("resume"), docs.get("one_slider")
-    try:
-        with st.spinner("Generating summary with the local model (can take a minute)..."):
-            result = ai.generate_summary(
-                resume.extracted_text if resume else "",
-                slider.extracted_text if slider else "",
-                feedback,
-            )
-        db.save_summary(
-            employee_id,
-            result["organization_summary"],
-            result["top_strengths"],
-            result["skills"],
-        )
-    except ai.SummaryError as exc:
-        flash("warning", f"Saved, but the summary was not updated: {exc}")
-        return False
-    flash("success", "AI summary updated.")
+    """Queue a background summary update (used by the folder import for existing employees)."""
+    jobs.queue_summary(employee_id)
     return True
 
 @st.fragment(run_every=3)
@@ -121,7 +101,10 @@ def job_status() -> None:
     if finished:
         st.rerun()        
 
-def handle_employee_save(selected_id, code, name, email, skills, status, resume_file, slider_file):
+def handle_employee_save(
+    selected_id, code, name, email, skills, status, resume_file, slider_file,
+    designation="", certs_text="", certs_before="",
+):
     uploads = [("resume", resume_file), ("one_slider", slider_file)]
 
     for _, f in uploads:
@@ -130,7 +113,9 @@ def handle_employee_save(selected_id, code, name, email, skills, status, resume_
             return
 
     try:
-        employee_id = db.save_employee(code, name, email, skills, status, employee_id=selected_id)
+        employee_id = db.save_employee(
+            code, name, email, skills, status, employee_id=selected_id, designation=designation
+        )
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -154,6 +139,22 @@ def handle_employee_save(selected_id, code, name, email, skills, status, resume_
         except ValueError as exc:
             flash("error", str(exc))
 
+    if saved_any:  # certifications are read by code (no AI), so they appear at once
+        stored = db.get_documents(employee_id)
+        db.save_ai_certifications(
+            employee_id,
+            ai.extract_certifications(
+                stored["resume"].extracted_text if "resume" in stored else "",
+                stored["one_slider"].extracted_text if "one_slider" in stored else "",
+            ),
+        )
+
+    if certs_text.strip() != certs_before.strip():  # only when HR actually changed the box
+        try:
+            db.save_manual_certifications(employee_id, db.parse_certifications(certs_text))
+        except ValueError as exc:
+            flash("error", str(exc))
+
     flash("success", f"Saved {name.strip()} (ID {code.strip()}).")
     jobs.queue("embed", employee_id)  # skill or status edits become searchable right away
     if saved_any:
@@ -174,11 +175,7 @@ def handle_feedback_submit(employee_id, manager, project, rating, pros, cons, co
         "success",
         "Replaced this manager's earlier review for the same project." if replaced else "Feedback saved.",
     )
-    if SUMMARY_ON_FEEDBACK:
-        jobs.queue_summary(employee_id)  # the summary job queues the embedding afterwards
-        flash("info", "Summary is updating in the background.")
-    else:
-        jobs.queue("embed", employee_id)  # keep search current, no AI summary
+    jobs.queue("embed", employee_id)  # reviews are searchable; the AI summary does not use them
     st.session_state["nonce"] += 1
     st.rerun()
 
@@ -252,6 +249,7 @@ with tab_admin:
     )
     current = by_id.get(selected_id)
     k = f"{selected_id}_{nonce}"
+    certs_before = db.format_certifications(db.get_certifications(current.id)) if current else ""
 
     with st.form(f"employee_form_{k}"):
         code = st.text_input("Employee ID", value=current.employee_code if current else "", key=f"code_{k}")
@@ -262,12 +260,25 @@ with tab_admin:
             value=current.primary_skills if current else "",
             key=f"skills_{k}",
         )
+        designation = st.text_input(
+            "Designation (job title)",
+            value=current.designation if current else "",
+            key=f"designation_{k}",
+            help="If left empty, the AI fills it from the resume or one-slider.",
+        )
         status_index = (
             db.STATUSES.index(current.availability_status)
             if current and current.availability_status in db.STATUSES
             else 0
         )
         status = st.selectbox("Availability status", db.STATUSES, index=status_index, key=f"status_{k}")
+        certs_text = st.text_area(
+            "Certifications (one per line: Name | Issuer | Year)",
+            value=certs_before,
+            key=f"certs_{k}",
+            height=110,
+            help="Issuer and year are optional. Anything you save here is kept as entered by HR.",
+        )
         resume_file = st.file_uploader("Resume (PDF or DOCX)", type=RESUME_TYPES, key=f"resume_{k}")
         slider_file = st.file_uploader("One-Slider (PPTX, DOCX or PDF)", type=SLIDER_TYPES, key=f"slider_{k}")
         submitted = st.form_submit_button("Save")
@@ -286,7 +297,25 @@ with tab_admin:
         )
 
     if submitted:
-        handle_employee_save(selected_id, code, name, email, skills, status, resume_file, slider_file)
+        handle_employee_save(
+            selected_id, code, name, email, skills, status, resume_file, slider_file,
+            designation=designation, certs_text=certs_text, certs_before=certs_before,
+        )
+
+    with st.expander("Maintenance"):
+        st.caption(
+            "Rebuilds the AI summary, designation and projects of every profile whose files changed "
+            "since the last run (profiles already up to date are skipped). "
+            "Runs one profile at a time in the background. Certifications typed by HR are kept."
+        )
+        sure = st.checkbox("I understand this overwrites the current AI summaries", key="regen_all_ok")
+        if st.button("Regenerate all summaries", key="regen_all", disabled=not sure):
+            doc_texts = db.get_all_document_texts()
+            targets = [e for e in employees if doc_texts.get(e.id)]
+            for e in targets:
+                jobs.queue_summary(e.id)
+            flash("info", f"Queued {len(targets)} summaries. Watch 'Profiles updating' in the sidebar.")
+            st.rerun()
 
     st.divider()
     st.subheader("Manager feedback")
@@ -322,11 +351,39 @@ setTimeout(function () {
 </script>
 """
 
+def projects_using(skill: str, projects: list) -> list:
+    """Names of the projects that mention this skill (in the tech list, name or description)."""
+    key = compact_skill(skill)
+    if len(key) < 2:
+        return []
+    words = normalize_skill(skill).split()
+    pattern = re.compile(
+        r"(?<![a-z0-9])" + r"[\s\-_/]*".join(re.escape(w) for w in words) + r"(?![a-z0-9])"
+    )
+    names = []
+    for p in projects:
+        tech_keys = {compact_skill(t) for t in p.get("technologies", [])}
+        text = normalize_skill(f"{p.get('name', '')} {p.get('description', '')}")
+        if key in tech_keys or pattern.search(text):
+            names.append(p.get("name") or "Unnamed project")
+    return names
+
+def skill_pills(skills: list, primary: bool) -> str:
+    """Skills as small horizontal pills (HTML). Primary = blue, secondary = grey."""
+    style = "display:inline-block;margin:2px 6px 4px 0;padding:2px 10px;border-radius:12px;font-size:0.85rem;" + (
+        "background:#e6efff;color:#0b3d91;border:1px solid #b9d0ff;"
+        if primary
+        else "background:#f1f3f5;color:#444;border:1px solid #dde1e5;"
+    )
+    return "".join(f'<span style="{style}">{html.escape(s)}</span>' for s in skills)
+
 def render_details(emp) -> None:
-    
+
     st.markdown('<div id="profile-top"></div>', unsafe_allow_html=True)
     st.divider()
-    st.subheader(emp.name)
+    summary = db.get_summary(emp.id)
+    title = emp.designation or (summary["designation"] if summary else "")
+    st.subheader(f"{emp.name} - {title}" if title else emp.name)
     st.caption(f"Employee ID {emp.employee_code}  |  {emp.email}  |  {emp.availability_status}")
 
     im_col, mail_col, _ = st.columns([1, 1, 5])
@@ -336,35 +393,75 @@ def render_details(emp) -> None:
     else:
         im_col.button("Send IM", key=f"im_{emp.id}", on_click=_noop, use_container_width=True)
         mail_col.button("Send Mail", key=f"mail_{emp.id}", on_click=_noop, use_container_width=True)
-    
+
     busy = emp.id in jobs.pending_ids()
     failure = jobs.error_for(emp.id)
     if busy:
-        st.info("Summary is being updated in the background. The previous summary is shown until it finishes.")
+        st.info("Profile is being updated in the background. The previous version is shown until it finishes.")
     elif failure:
         st.warning(f"Last background update failed: {failure}")
-        
-    summary = db.get_summary(emp.id)
-    typed_skills = [s for s in emp.primary_skills.split(",") if s.strip()]
 
+    typed_skills = [s for s in emp.primary_skills.split(",") if s.strip()]
+    certs = db.get_certifications(emp.id)
+    projects = summary["projects"] if summary else []
+
+    # 1. Executive summary (strengths sit under it)
+    st.markdown("#### Executive Summary")
     if summary:
-        st.markdown("#### Organization Summary")
         st.write(summary["organization_summary"])
-        st.markdown("#### Strengths")
-        for item in summary["top_strengths"]:
-            st.markdown(f"- {item}")
-        st.markdown("#### Employee Skills")
-        all_skills = merge_skills(typed_skills, summary["skills"])
-        st.markdown(" ".join(f"`{s}`" for s in all_skills) or "_None listed_")
+        # Strengths are switched off for now (the AI no longer writes them).
+        # To bring them back: ask the model for them again in ai_engine.py, then uncomment:
+        # if summary["top_strengths"]:
+        #     st.markdown("**Strengths**")
+        #     for item in summary["top_strengths"]:
+        #         st.markdown(f"- {item}")
         st.caption(f"Summary generated {fmt_dt(summary['generated_at'])} UTC")
     else:
-        st.info("No summary yet. Upload a one-slider/resume or add feedback, or click Regenerate.")
-        if typed_skills:
-            st.markdown("#### Employee Skills")
-            st.markdown(" ".join(f"`{s}`" for s in merge_skills(typed_skills)))
+        st.info("No summary yet. Upload a one-slider or resume, or click Regenerate.")
+
+    # 2. Skills: primary = used in a project, secondary = everything else
+    st.markdown("#### Skills")
+    all_skills = merge_skills(typed_skills, summary["skills"] if summary else [])
+    if projects:
+        primary = [s for s in all_skills if projects_using(s, projects)]
+    else:
+        primary = merge_skills(typed_skills)  # no project data yet: the skills HR typed come first
+    primary_keys = {compact_skill(s) for s in primary}
+    secondary = [s for s in all_skills if compact_skill(s) not in primary_keys]
+    if primary:
+        st.markdown("**Primary skills**")
+        st.markdown(skill_pills(primary, primary=True), unsafe_allow_html=True)
+    if secondary:
+        st.markdown("**Secondary skills**")
+        st.markdown(skill_pills(secondary, primary=False), unsafe_allow_html=True)
+    if not all_skills:
+        st.caption("None listed.")
+
+    # 3. Certifications
+    st.markdown("#### Certifications")
+    if certs:
+        for c in certs:
+            detail = ", ".join(x for x in (c.issuer, c.year) if x)
+            st.markdown(f"- **{c.name}**" + (f" ({detail})" if detail else ""))
+    else:
+        st.caption("None listed.")
+
+    # 4. Past projects (one-slider first, otherwise resume)
+    st.markdown("#### Past Projects")
+    if projects:
+        for p in projects:
+            with st.container(border=True):
+                st.markdown(f"**{p.get('name', '')}**" + (f"  -  {p['role']}" if p.get("role") else ""))
+                if p.get("description"):
+                    st.write(p["description"])
+                if p.get("technologies"):
+                    st.markdown(" ".join(f"`{t}`" for t in p["technologies"]))
+                st.caption("From the one-slider" if p.get("source") == "one_slider" else "From the resume")
+    else:
+        st.caption("No projects found. They appear after the summary is (re)generated from a one-slider or resume.")
 
     if st.button("Regenerate summary", key=f"regen_{emp.id}", disabled=busy):
-        jobs.queue_summary(emp.id)
+        jobs.queue_summary(emp.id, force=True)  # ignores the "files unchanged" shortcut
         st.rerun()
 
     st.markdown("#### Manager Review")
@@ -400,7 +497,6 @@ def render_details(emp) -> None:
                 )
             else:
                 st.button(button_label, disabled=True, key=f"dl_off_{doc_type}_{emp.id}")
-
 
 def _view(employee_id: int) -> None:
     st.session_state["view_emp"] = employee_id

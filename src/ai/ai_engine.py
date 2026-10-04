@@ -1,9 +1,10 @@
 """Text extraction + local LLM summary (Ollama). No cloud, no API keys."""
 
+import hashlib
 import io
 import json
 import os
-
+import re
 import httpx
 import ollama
 import pdfplumber
@@ -20,14 +21,23 @@ load_dotenv()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "6144"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 OLLAMA_MAX_OUTPUT = int(os.getenv("OLLAMA_MAX_OUTPUT", "600"))
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))
+OLLAMA_NUM_THREAD = int(os.getenv("OLLAMA_NUM_THREAD", "0"))  # 0 = let Ollama decide
 
-MAX_FEEDBACK_CHARS = 3000
-MAX_SLIDER_CHARS = 3500
-MAX_RESUME_CHARS = 3500
+# Only a guard against huge files: normal resumes and one-sliders are read completely.
+MAX_SLIDER_CHARS = int(os.getenv("MAX_SLIDER_CHARS", "6000"))
+MAX_RESUME_CHARS = int(os.getenv("MAX_RESUME_CHARS", "9000"))
+
+# Change when the prompts change: cached results (input hashes) are then redone.
+PROMPT_VERSION = "v3"
+
+# Per-call output limits (a tighter limit also stops runaway generation).
+SUMMARY_MAX_OUTPUT = 400
+PROJECTS_MAX_OUTPUT = 400
+MAX_CERTS_READ = 10
 
 # OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 # OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "180"))
@@ -106,80 +116,260 @@ def extract_text(file_name: str, file_bytes: bytes) -> str:
         raise ValueError(f"Old '{ext}' files are not supported. Save as .pptx/.docx.")
     raise ValueError(f"Unsupported file type '{ext}'. Use PDF, DOCX or PPTX.")
 
+# --------------------------------------------------------------------------
+# Text preparation
+# --------------------------------------------------------------------------
+_BULLET = re.compile(r"^[\s•●▪◦‣·\-–—*]+(?=\S)")
+
+
+def clean_text(text) -> str:
+    """Collapse spaces, drop empty or symbol-only lines and leading bullet marks (fewer tokens)."""
+    lines = []
+    for raw in (text or "").splitlines():
+        line = _BULLET.sub("", " ".join(raw.split()))
+        if line and re.search(r"\w", line):
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _prepare(text, limit: int) -> str:
+    return clean_text(text)[:limit]
+
+
+def input_hash(resume_text, one_slider_text, model=None) -> str:
+    """Fingerprint of everything the AI reads. Same fingerprint = the AI result is still valid."""
+    model = model or models.get_summary_model()
+    blob = "\n".join(
+        [PROMPT_VERSION, model, _prepare(one_slider_text, MAX_SLIDER_CHARS), _prepare(resume_text, MAX_RESUME_CHARS)]
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9+#.]+", (text or "").lower())
+
 
 # --------------------------------------------------------------------------
-# Prompt
+# Prompts. Both calls share the same system message and the same documents block,
+# and differ only in the TASK at the end, so Ollama can reuse the already-read text.
 # --------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are an HR assistant writing profiles of bench employees for project "
-    "managers. Use ONLY the information provided. Never invent skills, "
-    "employers, projects, dates, or facts. If information is missing, say so. "
-    "Source priority when sources overlap or disagree: 1) MANAGER FEEDBACK "
-    "(most trusted), 2) ORGANIZATION ONE-SLIDER, 3) RESUME (least weight). "
-    "Respond with JSON only, using exactly these keys: "
-    "organization_summary, top_strengths, skills."
+    "You are an HR assistant writing profiles of bench employees for project managers. "
+    "Use ONLY the information in the documents. Never invent skills, employers, projects, "
+    "titles, dates or facts. If something is missing, leave it empty. "
+    "Priority when the documents overlap or disagree: 1) ORGANIZATION ONE-SLIDER, 2) RESUME. "
+    "Respond with JSON only, containing exactly the fields requested in the TASK."
 )
 
-USER_TEMPLATE = """Write (be concise):
-1. organization_summary: 3-4 sentences, as a string, on what this person has done INSIDE OUR ORGANIZATION (roles, projects, contributions, how managers see them). Use the one-slider first, confirmed or adjusted by manager feedback. Use the resume only for one short sentence of background. If there is no one-slider, say so and rely on manager feedback.
-2. top_strengths: 3-5 bullets, at most 12 words each, as a list of strings. Prefer strengths backed by manager pros/comments, then the one-slider, then the resume.
-3. skills: up to 20 short skill names (tools, technologies, domains), 1-4 words each, from ALL three sources. No sentences, no duplicates.
-
-Do not invent anything not present in the text.
-
-### MANAGER FEEDBACK (highest priority)
-{feedback}
-
-### ORGANIZATION ONE-SLIDER (second priority)
+DOCUMENTS_TEMPLATE = """### ORGANIZATION ONE-SLIDER (first priority)
 {one_slider}
 
-### RESUME (career background, lowest priority)
+### RESUME (second priority)
 {resume}
+
 """
+
+SUMMARY_TASK = """### TASK
+Return JSON with these fields:
+1. headline: the professional title shown directly under the person's name at the top of the resume, or the title on the one-slider (for example "Data Scientist"). Empty string if there is none.
+2. current_role: the person's most recent job title in the experience section (for example "Associate Manager"). Empty string if there is none.
+3. organization_summary: 3 sentences on what this person has done INSIDE OUR ORGANIZATION (roles, projects, contributions). Use the one-slider first and the resume for background. If there is no one-slider, say so and summarise the resume.
+4. skills: up to 20 short skill names (tools, technologies, domains), 1-4 words each, from both documents. No sentences, no duplicates.
+"""
+
+PROJECTS_TASK = """### TASK
+Return JSON with one field, projects: up to 4 past projects, most recent first (if there are no dates, keep the order in which they are listed). Take them from the ONE-SLIDER first; use the RESUME only if the one-slider describes no projects. Each project has: name, description (ONE sentence, at most 18 words), technologies (at most 4 short tool names) and source ("one_slider" or "resume"). Empty list if no projects are described.
+"""
+
+_STR = {"type": "string"}
+_STR_LIST = {"type": "array", "items": _STR}
 
 SUMMARY_SCHEMA = {
     "type": "object",
     "properties": {
-        "organization_summary": {"type": "string"},
-        "top_strengths": {"type": "array", "items": {"type": "string"}},
-        "skills": {"type": "array", "items": {"type": "string"}},
+        "headline": _STR,
+        "current_role": _STR,
+        "organization_summary": _STR,
+        "skills": _STR_LIST,
     },
-    "required": ["organization_summary", "top_strengths", "skills"],
+    "required": ["headline", "current_role", "organization_summary", "skills"],
 }
 
+PROJECTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "projects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": _STR,
+                    "description": _STR,
+                    "technologies": _STR_LIST,
+                    "source": {"type": "string", "enum": ["one_slider", "resume"]},
+                },
+                "required": ["name", "description", "technologies", "source"],
+            },
+        }
+    },
+    "required": ["projects"],
+}
 
-def _truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit] + "\n[...truncated]"
-
-
-def _field(item, name: str) -> str:
-    value = item.get(name, "") if isinstance(item, dict) else getattr(item, name, "")
-    return "" if value is None else str(value)
-
-
-def _format_feedback(feedback_list) -> str:
-    """Newest-first list in, trimmed to the character budget."""
-    blocks, used = [], 0
-    for item in feedback_list:
-        block = (
-            f"- Manager: {_field(item, 'manager_name')} | "
-            f"Project: {_field(item, 'project_name') or 'n/a'} | "
-            f"Rating: {_field(item, 'rating')}/5\n"
-            f"  Pros: {_field(item, 'pros') or 'None'}\n"
-            f"  Cons: {_field(item, 'cons') or 'None'}\n"
-            f"  Comments: {_field(item, 'comments') or 'None'}"
+def build_prompt(task: str, resume_text: str, one_slider_text: str) -> str:
+    """Documents first (identical for every call), task last."""
+    return (
+        DOCUMENTS_TEMPLATE.format(
+            one_slider=_prepare(one_slider_text, MAX_SLIDER_CHARS) or "Not provided",
+            resume=_prepare(resume_text, MAX_RESUME_CHARS) or "Not provided",
         )
-        if used + len(block) > MAX_FEEDBACK_CHARS and blocks:
+        + task
+    )
+
+
+# --------------------------------------------------------------------------
+# Certifications: read by code (exact wording, no model time)
+# --------------------------------------------------------------------------
+_CERT_HEAD = re.compile(
+    r"^\W*(?:professional\s+|technical\s+|key\s+)?"
+    r"(?:certifications?|certificates?|licen[cs]es?|courses|trainings?)\b",
+    re.I,
+)
+# A heading line consists ONLY of a known heading (so "Project Management Professional" is not one).
+_OTHER_HEAD = re.compile(
+    r"^\W*(?:education(?:al)?(?:\s+(?:background|qualifications?))?|academics?|"
+    r"(?:work\s+|professional\s+|relevant\s+)?experience|employment(?:\s+history)?|"
+    r"(?:key\s+|major\s+)?projects?|(?:technical\s+|key\s+|core\s+)?skills?|"
+    r"(?:professional\s+)?(?:summary|profile)|objective|achievements?|"
+    r"awards?(?:\s*(?:&|and)\s*\w+)?|publications?|languages?|interests?|"
+    r"hobbies(?:\s*(?:&|and)\s*interests?)?|references?|declaration|personal(?:\s+details)?)\W*$",
+    re.I,
+)
+_YEAR = re.compile(r"\(?\b((?:19|20)\d{2})\b\)?")
+_SPLIT = re.compile(r"\s+[–—-]\s+|\s*\|\s*")
+_CERT_WORD = re.compile(r"\b(?:certified|certification|certificate)\b", re.I)
+_TRIM = " -–—•*·,;:"
+
+
+def _cert_section_lines(text: str) -> list[str]:
+    """Lines under a 'Certifications' heading, up to the next known heading."""
+    lines, grabbing = [], False
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not grabbing:
+            match = _CERT_HEAD.match(line)
+            if not match:
+                continue
+            rest = line[match.end():].strip()
+            if len(rest) > 25 and not rest.startswith((":", "-", "–", "—", "|")):
+                continue  # a sentence that merely starts with the word
+            grabbing = True
+            inline = rest.lstrip(":-–—| ").strip()
+            if inline and not re.fullmatch(
+                r"(?:&|and)?\s*(?:licen[cs]es?|certifications?|certificates?|training)", inline, re.I
+            ):  # "Certifications: AWS SAA; Azure DP-100": the list is on the heading line
+                lines.extend(p.strip() for p in re.split(r"[;,]", inline) if p.strip())
+            continue
+        if _OTHER_HEAD.match(line):
             break
-        blocks.append(block)
-        used += len(block)
-    return "\n".join(blocks)
+        lines.append(line)
+        if len(lines) >= 25:
+            break
+    return lines
 
 
+def _fallback_cert_lines(text: str) -> list[str]:
+    """Used only when no document has a Certifications heading: short lines that say 'certified'."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if _CERT_WORD.search(line) and len(line) <= 100 and len(line.split()) <= 12:
+            out.append(line)
+    return out[:8]
+
+
+def _join_wrapped(lines: list[str]) -> list[str]:
+    """A line that starts in lower case, or follows a line ending in a comma/dash/'and', continues it."""
+    out: list[str] = []
+    for line in lines:
+        if out and (line[:1].islower() or out[-1].endswith((",", "-", "–", "&", " and", " of"))):
+            out[-1] = out[-1] + " " + line
+        else:
+            out.append(line)
+    return out
+
+
+def _parse_cert(line: str):
+    """'Name – Issuer (2023)' -> {name, issuer, year}; None if the line is not a certification."""
+    line = " ".join(line.split()).strip(_TRIM)
+    year = ""
+    found = list(_YEAR.finditer(line))
+    if found:
+        last = found[-1]
+        year = last.group(1)
+        line = " ".join((line[: last.start()] + " " + line[last.end():]).split()).strip(_TRIM)
+    if line.count("(") != line.count(")"):  # a stray bracket left behind when a year was cut out
+        line = line.replace("(", "").replace(")", "")
+    parts = [p.strip(_TRIM) for p in _SPLIT.split(line) if p.strip(_TRIM)]
+    if not parts:
+        return None
+    name, issuer = parts[0], ", ".join(parts[1:])
+    if len(name) < 3 or len(name) > 150 or len(name.split()) > 20 or not re.search(r"[A-Za-z]", name):
+        return None
+    return {"name": name, "issuer": issuer if len(issuer) <= 80 else "", "year": year}
+
+
+def extract_certifications(resume_text: str, one_slider_text: str) -> list[dict]:
+    """Certifications exactly as written in the files. No model is used.
+
+    Reads the 'Certifications' section of the one-slider and the resume. If neither document
+    has one, falls back to short lines that contain 'certified' or 'certification'.
+    """
+    sources = [clean_text(one_slider_text), clean_text(resume_text)]
+    sectioned = [_cert_section_lines(t) for t in sources]
+    if any(sectioned):
+        lines = [line for group in sectioned for line in group]
+    else:
+        lines = [line for t in sources for line in _fallback_cert_lines(t)]
+
+    out, seen = [], set()
+    for line in _join_wrapped(lines):
+        cert = _parse_cert(line)
+        if cert is None:
+            continue
+        key = " ".join(_words(cert["name"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cert)
+    return out[:MAX_CERTS_READ]
+
 # --------------------------------------------------------------------------
-# Summary generation
+# Talking to the model
 # --------------------------------------------------------------------------
-def _chat(client: ollama.Client, user_prompt: str, model: str) -> str:
+def _log_timing(label: str, response) -> None:
+    """One line per call. For the second call, a much lower 'prompt' token count means the
+    already-read documents were reused."""
+    def num(name: str) -> float:
+        return float(getattr(response, name, 0) or 0)
+
+    print(
+        f"[ai] {label}: prompt {int(num('prompt_eval_count'))} tokens in "
+        f"{num('prompt_eval_duration') / 1e9:.1f}s, output {int(num('eval_count'))} tokens in "
+        f"{num('eval_duration') / 1e9:.1f}s",
+        flush=True,
+    )
+
+
+def _chat(client: ollama.Client, user_prompt: str, schema: dict, model: str, max_output: int, label: str) -> str:
+    options = {
+        "temperature": 0.2,
+        "num_ctx": OLLAMA_NUM_CTX,
+        "num_predict": min(OLLAMA_MAX_OUTPUT, max_output),
+    }
+    if OLLAMA_NUM_THREAD > 0:
+        options["num_thread"] = OLLAMA_NUM_THREAD
     try:
         response = client.chat(
             model=model,
@@ -187,28 +377,40 @@ def _chat(client: ollama.Client, user_prompt: str, model: str) -> str:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            format=SUMMARY_SCHEMA,
+            format=schema,
             keep_alive=OLLAMA_KEEP_ALIVE,
-            options={"temperature": 0.2, "num_ctx": OLLAMA_NUM_CTX, "num_predict": OLLAMA_MAX_OUTPUT},
+            options=options,
         )
     except ollama.ResponseError as exc:
         if exc.status_code == 404:
-            raise SummaryError(
-                f"Model '{model}' is not installed. "
-                f"Run: ollama pull {model}"
-            )
+            raise SummaryError(f"Model '{model}' is not installed. Run: ollama pull {model}")
         raise SummaryError(f"Ollama error: {exc.error}")
     except (ConnectionError, httpx.ConnectError):
-        raise SummaryError(
-            "Cannot reach Ollama. Make sure it is running (try: ollama serve)."
-        )
+        raise SummaryError("Cannot reach Ollama. Make sure it is running (try: ollama serve).")
     except httpx.TimeoutException:
-        raise SummaryError(
-            "The model took too long to respond. Try again, or raise OLLAMA_TIMEOUT."
-        )
+        raise SummaryError("The model took too long to respond. Try again, or raise OLLAMA_TIMEOUT.")
+    _log_timing(label, response)
     return response["message"]["content"]
 
 
+def _ask(task: str, schema: dict, max_output: int, label: str, resume_text: str, slider_text: str, model: str) -> dict:
+    """One model call -> parsed JSON dict. Retries once if the JSON is unusable."""
+    prompt = build_prompt(task, resume_text, slider_text)
+    client = ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_TIMEOUT)
+    for _attempt in range(2):
+        content = _chat(client, prompt, schema, model, max_output, label)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    raise SummaryError("The model returned an unusable answer twice. Try again.")
+
+
+# --------------------------------------------------------------------------
+# Cleaning the model's answer
+# --------------------------------------------------------------------------
 def _as_list(value) -> list[str]:
     if isinstance(value, str):
         value = [value]
@@ -217,47 +419,104 @@ def _as_list(value) -> list[str]:
     return [str(v).strip() for v in value if str(v).strip()]
 
 
-def _normalize(data: dict) -> dict:
+def _one_line(value, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _supported(text: str, haystack: str, share: float = 1.0) -> bool:
+    """True if at least `share` of the words in `text` occur in the source text
+    (a cheap guard against the model inventing a title)."""
+    tokens = [t for t in _words(text) if len(t) >= 2]
+    if not tokens:
+        return False
+    found = sum(1 for t in tokens if t in haystack)
+    return found / len(tokens) >= share
+
+
+def _source_text(resume_text: str, slider_text: str) -> str:
+    return (clean_text(slider_text) + "\n" + clean_text(resume_text)).lower()
+
+
+def _clean_projects(value) -> list[dict]:
+    out = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = _one_line(item.get("name"), 120)
+        description = _one_line(item.get("description"), 200)
+        if not name and not description:
+            continue
+        source = str(item.get("source") or "").strip().lower()
+        out.append(
+            {
+                "name": name or description[:60],
+                "role": _one_line(item.get("role"), 80),
+                "description": description,
+                "technologies": merge_skills(_as_list(item.get("technologies")))[:5],
+                "source": source if source in ("one_slider", "resume") else "resume",
+            }
+        )
+    return out[:4]
+
+
+# --------------------------------------------------------------------------
+# Public functions
+# --------------------------------------------------------------------------
+def generate_summary_part(resume_text: str, one_slider_text: str, model=None) -> dict:
+    """Call 1. Returns {'designation', 'organization_summary', 'skills'}.
+    Raises SummaryError with a user-friendly message on any failure."""
+    if not (clean_text(resume_text) or clean_text(one_slider_text)):
+        raise SummaryError("Nothing to summarize yet. Upload a resume or one-slider first.")
+    model = model or models.get_summary_model()
+    data = _ask(SUMMARY_TASK, SUMMARY_SCHEMA, SUMMARY_MAX_OUTPUT, "summary", resume_text, one_slider_text, model)
+
     overview = str(data.get("organization_summary", "")).strip()
     if not overview:
-        raise ValueError("empty organization summary")
+        raise SummaryError("The model returned an empty summary. Try again.")
+    haystack = _source_text(resume_text, one_slider_text)
+    titles: list[str] = []
+    for field_name in ("headline", "current_role"):
+        title = _one_line(data.get(field_name), 80)
+        if not title or len(title.split()) > 8 or not _supported(title, haystack, 0.5):
+            continue  # empty, too long for a title, or not found in the files
+        low = title.lower()
+        if any(low in t.lower() for t in titles):
+            continue  # already covered by a longer title
+        titles = [t for t in titles if t.lower() not in low] + [title]
+    designation = " - ".join(titles)
+    print(f"[ai] designation: {designation!r}", flush=True)
     return {
+        "designation": designation,
         "organization_summary": overview,
-        "top_strengths": _as_list(data.get("top_strengths"))[:5],
         "skills": merge_skills(_as_list(data.get("skills")))[:25],
     }
 
 
-def generate_summary(resume_text: str, one_slider_text: str, feedback_list, model=None) -> dict:
-    """Return {'organization_summary': str, 'top_strengths': [...], 'skills': [...]}.
+def generate_projects(resume_text: str, one_slider_text: str, model=None) -> list[dict]:
+    """Call 2. Up to 4 projects: {name, role, description, technologies, source}.
+    Raises SummaryError on failure."""
+    if not (clean_text(resume_text) or clean_text(one_slider_text)):
+        return []
+    model = model or models.get_summary_model()
+    data = _ask(PROJECTS_TASK, PROJECTS_SCHEMA, PROJECTS_MAX_OUTPUT, "projects", resume_text, one_slider_text, model)
+    return _clean_projects(data.get("projects"))
 
-    feedback_list: Feedback objects (or dicts), newest first.
-    Raises SummaryError with a user-friendly message on any failure.
+
+def generate_summary(resume_text: str, one_slider_text: str, feedback_list=None, model=None) -> dict:
+    """Both calls plus the certification parser, in one result (used by the folder import).
+
+    feedback_list is accepted only so older callers keep working: manager reviews are
+    no longer part of the AI summary. If the projects call fails, the key 'projects' is
+    left out so stored projects are not overwritten.
     """
-    resume_text = (resume_text or "").strip()
-    one_slider_text = (one_slider_text or "").strip()
-    feedback_text = _format_feedback(feedback_list or [])
-
-    if not (resume_text or one_slider_text or feedback_text):
-        raise SummaryError(
-            "Nothing to summarize yet. Upload a resume/one-slider or add feedback."
-        )
-
-    user_prompt = USER_TEMPLATE.format(
-        feedback=feedback_text or "None",
-        one_slider=_truncate(one_slider_text, MAX_SLIDER_CHARS) or "Not provided",
-        resume=_truncate(resume_text, MAX_RESUME_CHARS) or "Not provided",
-    )
-
-    model = model or models.get_summary_model()  # current dropdown choice unless overridden
-    client = ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_TIMEOUT)
-    for _attempt in range(2):  # one retry if the JSON is unusable
-        content = _chat(client, user_prompt, model)
-        try:
-            return _normalize(json.loads(content))
-        except (json.JSONDecodeError, ValueError, AttributeError):
-            continue
-    raise SummaryError("The model returned an unusable answer twice. Try again.")
+    result = generate_summary_part(resume_text, one_slider_text, model)
+    try:
+        result["projects"] = generate_projects(resume_text, one_slider_text, model)
+    except SummaryError:
+        pass
+    result["certifications"] = extract_certifications(resume_text, one_slider_text)
+    result["top_strengths"] = []  # the Strengths section is switched off for now
+    return result
 
 
 def check_ollama() -> tuple[bool, str]:
@@ -269,4 +528,3 @@ def check_ollama() -> tuple[bool, str]:
     if models.is_installed(model, installed):
         return True, f"Ollama ready ({model})"
     return False, f"Model not installed. Run: ollama pull {model}"
-

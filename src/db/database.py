@@ -10,6 +10,7 @@ returned as Python lists by get_summary().
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -43,6 +44,7 @@ class Employee(SQLModel, table=True):
     email: str = Field(unique=True, index=True)
     primary_skills: str = ""  # comma-separated
     availability_status: str = "Available"
+    designation: str = ""  # job title, e.g. "Senior Data Scientist"
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -79,7 +81,24 @@ class Summary(SQLModel, table=True):
     organization_summary: str = ""
     top_strengths: str = "[]"  # JSON list
     skills: str = "[]"  # JSON list
+    projects: str = "[]"  # JSON list of {name, role, description, technologies, source}
+    input_hash: str = ""  # hash of resume + one-slider + model: unchanged = the AI is skipped
+    ai_designation: str = ""  # title read by the AI; HR's own title (Employee.designation) wins
     generated_at: datetime = Field(default_factory=utcnow)
+
+class Certification(SQLModel, table=True):
+    # source "ai"     = found automatically in the files (by the parser), replaced on every refresh
+    # source "manual" = typed or confirmed by HR, never touched by the AI
+    __table_args__ = (UniqueConstraint("employee_id", "cert_key"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    employee_id: int = Field(foreign_key="employee.id", index=True)
+    cert_key: str  # normalized name, used to skip duplicates
+    name: str
+    issuer: str = ""
+    year: str = ""
+    source: str = "manual"
+    created_at: datetime = Field(default_factory=utcnow)
 
 class EmployeeEmbedding(SQLModel, table=True):
     # One vector per employee per kind. doc_hash + model tell us when it is stale.
@@ -158,7 +177,15 @@ def _session() -> Session:
 def init_db() -> None:
     """Create tables, then add any columns introduced after first creation."""
     SQLModel.metadata.create_all(engine)
-    wanted = {"feedback": {"project_name": "VARCHAR DEFAULT ''"}}
+    wanted = {
+        "feedback": {"project_name": "VARCHAR DEFAULT ''"},
+        "employee": {"designation": "VARCHAR DEFAULT ''"},
+        "summary": {
+            "projects": "VARCHAR DEFAULT '[]'",
+            "input_hash": "VARCHAR DEFAULT ''",
+            "ai_designation": "VARCHAR DEFAULT ''",
+        },
+    }
     inspector = inspect(engine)
     with engine.begin() as conn:
         for table, columns in wanted.items():
@@ -178,6 +205,7 @@ def save_employee(
     primary_skills: str = "",
     availability_status: str = "Available",
     employee_id: Optional[int] = None,
+    designation: Optional[str] = None,
 ) -> int:
     """Insert a new employee, or update one if employee_id (database id) is given.
 
@@ -190,6 +218,8 @@ def save_employee(
         s.strip() for s in (primary_skills or "").split(",") if s.strip()
     )
 
+    if designation is not None:
+        designation = " ".join(designation.split())[:120]
     if not employee_code:
         raise ValueError("Employee ID is required.")
     if not name:
@@ -220,6 +250,8 @@ def save_employee(
             employee.email = email
             employee.primary_skills = primary_skills
             employee.availability_status = availability_status
+            if designation is not None:
+                employee.designation = designation
             employee.updated_at = utcnow()
         else:
             employee = Employee(
@@ -228,6 +260,7 @@ def save_employee(
                 email=email,
                 primary_skills=primary_skills,
                 availability_status=availability_status,
+                designation=designation or "",
             )
         session.add(employee)
         try:
@@ -380,8 +413,14 @@ def save_summary(
     organization_summary: str,
     top_strengths: list[str],
     skills: list[str],
+    projects: Optional[list] = None,
+    input_hash: Optional[str] = None,
+    ai_designation: Optional[str] = None,
 ) -> None:
-    """Upsert: one summary per employee, overwritten on every regeneration."""
+    """Upsert: one summary per employee, overwritten on every regeneration.
+
+    projects=None and input_hash=None leave the stored values unchanged.
+    """
     with _session() as session:
         if session.get(Employee, employee_id) is None:
             raise ValueError("Employee not found.")
@@ -395,7 +434,30 @@ def save_summary(
         summary.organization_summary = organization_summary
         summary.top_strengths = json.dumps(top_strengths)
         summary.skills = json.dumps(skills)
+        if projects is not None:
+            summary.projects = json.dumps(projects)
+        if input_hash is not None:
+            summary.input_hash = input_hash
+        if ai_designation is not None:
+            summary.ai_designation = " ".join(ai_designation.split())[:120]
         summary.generated_at = utcnow()
+        session.add(summary)
+        session.commit()
+
+
+def save_projects(employee_id: int, projects: list, input_hash: Optional[str] = None) -> None:
+    """Save only the projects (the other AI call may have failed). Creates the row if needed."""
+    with _session() as session:
+        if session.get(Employee, employee_id) is None:
+            raise ValueError("Employee not found.")
+        summary = session.exec(
+            select(Summary).where(Summary.employee_id == employee_id)
+        ).first()
+        if summary is None:
+            summary = Summary(employee_id=employee_id)
+        summary.projects = json.dumps(projects)
+        if input_hash is not None:
+            summary.input_hash = input_hash
         session.add(summary)
         session.commit()
 
@@ -406,6 +468,13 @@ def _loads_list(text: str) -> list[str]:
     except (json.JSONDecodeError, TypeError):
         return [text] if text else []
     return value if isinstance(value, list) else [str(value)]
+
+def _loads_dicts(text: str) -> list[dict]:
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
 
 
 def get_summary(employee_id: int) -> Optional[dict]:
@@ -420,6 +489,9 @@ def get_summary(employee_id: int) -> Optional[dict]:
             "organization_summary": summary.organization_summary,
             "top_strengths": _loads_list(summary.top_strengths),
             "skills": _loads_list(summary.skills),
+            "projects": _loads_dicts(summary.projects),
+            "input_hash": summary.input_hash or "",
+            "designation": summary.ai_designation or "",
             "generated_at": summary.generated_at,
         }
 
@@ -508,6 +580,7 @@ def get_all_summaries() -> dict:
                 "organization_summary": s.organization_summary,
                 "top_strengths": _loads_list(s.top_strengths),
                 "skills": _loads_list(s.skills),
+                "designation": s.ai_designation or "",
             }
             for s in session.exec(select(Summary)).all()
         }
@@ -660,3 +733,154 @@ def get_all_document_texts() -> dict:
     for employee_id, doc_type, text_value in rows:
         out.setdefault(employee_id, {})[doc_type] = text_value or ""
     return out
+
+# --------------------------------------------------------------------------
+# Designation and certifications
+# --------------------------------------------------------------------------
+MAX_CERTS = 20
+
+
+def set_designation_if_empty(employee_id: int, designation: str) -> bool:
+    """Fill the designation from the AI only when HR has not set one. True if it was set."""
+    designation = " ".join((designation or "").split())[:120]
+    if not designation:
+        return False
+    with _session() as session:
+        employee = session.get(Employee, employee_id)
+        if employee is None or (employee.designation or "").strip():
+            return False
+        employee.designation = designation
+        employee.updated_at = utcnow()
+        session.add(employee)
+        session.commit()
+        return True
+
+
+def _cert_key(name: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9+#.]+", (name or "").lower()))
+
+
+def _clean_cert(item) -> Optional[dict]:
+    if isinstance(item, str):
+        item = {"name": item}
+    if not isinstance(item, dict):
+        return None
+    name = " ".join(str(item.get("name") or "").split())[:150]
+    if not _cert_key(name):
+        return None
+    return {
+        "name": name,
+        "issuer": " ".join(str(item.get("issuer") or "").split())[:80],
+        "year": " ".join(str(item.get("year") or "").split())[:10],
+    }
+
+
+def _replace_certs(employee_id: int, certs: list, source: str, only_ai: bool) -> int:
+    """Delete old rows (only the 'ai' ones, or all), then insert the new list. Returns rows added."""
+    with _session() as session:
+        if session.get(Employee, employee_id) is None:
+            raise ValueError("Employee not found.")
+        query = select(Certification).where(Certification.employee_id == employee_id)
+        if only_ai:
+            query = query.where(Certification.source == "ai")
+        for row in session.exec(query).all():
+            session.delete(row)
+        session.flush()  # deletes must reach the DB before the inserts below
+        seen = {
+            row.cert_key
+            for row in session.exec(
+                select(Certification).where(Certification.employee_id == employee_id)
+            ).all()
+        }
+        added = 0
+        for item in certs or []:
+            clean = _clean_cert(item)
+            if clean is None:
+                continue
+            key = _cert_key(clean["name"])
+            if key in seen or added >= MAX_CERTS:
+                continue
+            seen.add(key)
+            session.add(Certification(employee_id=employee_id, cert_key=key, source=source, **clean))
+            added += 1
+        session.commit()
+        return added
+
+
+def save_ai_certifications(employee_id: int, certs: list) -> int:
+    """Replace the AI-read certifications. HR-entered ones are kept and win on duplicates."""
+    return _replace_certs(employee_id, certs, "ai", only_ai=True)
+
+
+def save_manual_certifications(employee_id: int, certs: list) -> int:
+    """HR's list is the full truth: replaces every certification (AI and manual)."""
+    return _replace_certs(employee_id, certs, "manual", only_ai=False)
+
+
+def get_certifications(employee_id: int) -> list:
+    """Certifications of one employee, in the order they were added."""
+    with _session() as session:
+        return list(
+            session.exec(
+                select(Certification)
+                .where(Certification.employee_id == employee_id)
+                .order_by(col(Certification.id))
+            ).all()
+        )
+
+
+def get_all_certifications() -> dict:
+    """{employee_id: [Certification, ...]} for every employee (used by the search index)."""
+    with _session() as session:
+        rows = session.exec(select(Certification).order_by(col(Certification.id))).all()
+    out: dict = {}
+    for cert in rows:
+        out.setdefault(cert.employee_id, []).append(cert)
+    return out
+
+
+def format_certifications(certs: list) -> str:
+    """Certification rows -> the HR text box: one 'Name | Issuer | Year' per line."""
+    lines = []
+    for c in certs:
+        parts = [c.name, c.issuer, c.year] if (c.issuer or c.year) else [c.name]
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
+def parse_certifications(text: str) -> list:
+    """The HR text box -> [{name, issuer, year}]. Blank lines and bullet marks are ignored."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip().lstrip("-*•").strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        out.append(
+            {
+                "name": parts[0],
+                "issuer": parts[1] if len(parts) > 1 else "",
+                "year": parts[2] if len(parts) > 2 else "",
+            }
+        )
+    return out
+
+
+def save_ai_result(employee_id: int, result: dict, input_hash: Optional[str] = None) -> None:
+    """Save what generate_summary() returned.
+
+    Optional parts are saved only if they are in the result: a missing 'projects' keeps the stored
+    ones, a missing 'certifications' keeps the stored ones. The AI's title is stored separately
+    from HR's (HR's title wins on display). input_hash marks these inputs as processed.
+    """
+    save_summary(
+        employee_id,
+        result["organization_summary"],
+        result.get("top_strengths", []),
+        result.get("skills", []),
+        projects=result.get("projects"),
+        input_hash=input_hash,
+        ai_designation=result.get("designation"),
+    )
+    if "certifications" in result:
+        save_ai_certifications(employee_id, result["certifications"])

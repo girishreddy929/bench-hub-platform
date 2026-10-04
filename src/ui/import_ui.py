@@ -54,6 +54,8 @@ def _save_edit(uid) -> None:
     d.email = ss[f"ed_email_{uid}"].strip()
     d.skills = ss[f"ed_skills_{uid}"].strip()
     d.status = ss[f"ed_status_{uid}"]
+    d.designation = ss[f"ed_designation_{uid}"].strip()
+    d.certs = ss[f"ed_certs_{uid}"].strip()
     d.exists = bool(new_code) and db.get_employee_by_code(new_code) is not None
     d.error = ""
     _clear_edit_keys(uid)
@@ -89,7 +91,10 @@ def review_dialog(refresh_summary):
         with st.container(border=True):
             c = st.columns([1.6, 2.6, 3.6, 0.6, 0.6])
             c[0].markdown(f"**{_status(d)}**")
-            c[1].markdown(f"**{d.name or '(no name)'}**  \nID {d.code or '(missing)'}")
+            c[1].markdown(
+                f"**{d.name or '(no name)'}**  \nID {d.code or '(missing)'}"
+                + (f"  \n{d.designation}" if d.designation else "")
+            )
             c[2].markdown(f"{d.email or '(no email)'}  \n{d.skills or '(no skills)'}")
             c[3].button("✏️", key=f"edit_{d.uid}", on_click=_start_edit, args=(d.uid,), help="Edit")
             c[4].button("🗑️", key=f"del_{d.uid}", on_click=_delete, args=(d.uid,), help="Do not upload")
@@ -97,6 +102,8 @@ def review_dialog(refresh_summary):
                 f"Resume: {os.path.basename(d.resume_path) if d.resume_path else 'none'}  |  "
                 f"One-slider: {os.path.basename(d.slider_path) if d.slider_path else 'none'}"
             )
+            cert_count = len([ln for ln in d.certs.splitlines() if ln.strip()])
+            st.caption(f"Certifications: {cert_count}  |  Projects found: {len(d.projects)}")
             for note in imp.problems(d) + d.notes + ([d.error] if d.error else []):
                 st.caption(f"⚠ {note}")
 
@@ -106,6 +113,11 @@ def review_dialog(refresh_summary):
                     st.text_input("Name", value=d.name, key=f"ed_name_{d.uid}")
                     st.text_input("Email", value=d.email, key=f"ed_email_{d.uid}")
                     st.text_input("Skills (comma-separated)", value=d.skills, key=f"ed_skills_{d.uid}")
+                    st.text_input("Designation", value=d.designation, key=f"ed_designation_{d.uid}")
+                    st.text_area(
+                        "Certifications (one per line: Name | Issuer | Year)",
+                        value=d.certs, key=f"ed_certs_{d.uid}", height=110,
+                    )
                     st.selectbox(
                         "Status", db.STATUSES,
                         index=db.STATUSES.index(d.status) if d.status in db.STATUSES else 0,

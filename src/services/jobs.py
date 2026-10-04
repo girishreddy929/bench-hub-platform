@@ -1,38 +1,63 @@
-"""Background jobs (one worker, because Ollama runs one job at a time). No Streamlit here."""
+"""Background jobs: AI summaries on one slow worker, search indexing on its own fast worker.
+No Streamlit here."""
 
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 from src.ai import ai_engine as ai
+from src.ai import models
 from src.db import database as db
 from src.search import indexer
 
 _lock = threading.Lock()
-_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bench-jobs")
+_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bench-jobs")        # summaries (slow)
+_embed_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bench-embed")  # search index (seconds)
 _pending: dict = {}   # (kind, employee_id) -> queued + running count
 _errors: dict = {}    # (kind, employee_id) -> last failure message
+_force: set = set()   # employee ids whose next summary run must ignore the input-hash cache
 
 
 def _do_summary(employee_id: int) -> None:
     try:
+        with _lock:
+            force = employee_id in _force
+            _force.discard(employee_id)
+
         docs = db.get_documents(employee_id)
-        feedback = db.get_feedback(employee_id)
-        resume, slider = docs.get("resume"), docs.get("one_slider")
-        result = ai.generate_summary(
-            resume.extracted_text if resume else "",
-            slider.extracted_text if slider else "",
-            feedback,
-        )
-        db.save_summary(
-            employee_id,
-            result["organization_summary"],
-            result["top_strengths"],
-            result["skills"],
-        )
+        resume = docs["resume"].extracted_text if "resume" in docs else ""
+        slider = docs["one_slider"].extracted_text if "one_slider" in docs else ""
+
+        # 1. Certifications are read by code: instant, exact wording, HR-entered ones are kept.
+        db.save_ai_certifications(employee_id, ai.extract_certifications(resume, slider))
+
+        # 2. Skip the AI when the files (and model) are unchanged since the last good run.
+        new_hash = ai.input_hash(resume, slider, models.get_summary_model())
+        stored = db.get_summary(employee_id)
+        if not force and stored and stored["organization_summary"] and stored["input_hash"] == new_hash:
+            return
+
+        # 3. Two small AI calls. Whatever succeeds is saved; a failure in one keeps the other.
+        problems, summary_ok = [], False
+        try:
+            part = ai.generate_summary_part(resume, slider)
+            db.save_summary(
+                employee_id, part["organization_summary"], [], part["skills"],
+                ai_designation=part["designation"],
+            )
+            summary_ok = True
+        except ai.SummaryError as exc:
+            problems.append(f"summary: {exc}")
+        try:
+            projects = ai.generate_projects(resume, slider)
+            # the hash is stored only when both calls worked, so a half-failed run is retried
+            db.save_projects(employee_id, projects, input_hash=new_hash if summary_ok else None)
+        except ai.SummaryError as exc:
+            problems.append(f"projects: {exc}")
+        if problems:
+            raise ai.SummaryError("; ".join(problems))
     finally:
         queue("embed", employee_id)  # vectors follow the summary, even if it failed
-
 
 def _do_embed(employee_id: int) -> None:
     indexer.index_employee(employee_id)
@@ -68,10 +93,14 @@ def queue(kind: str, employee_id: int) -> None:
             return
         _pending[key] = _pending.get(key, 0) + 1
         _errors.pop(key, None)
-    _pool.submit(_run, kind, employee_id)
+    (_embed_pool if kind == "embed" else _pool).submit(_run, kind, employee_id)
 
 
-def queue_summary(employee_id: int) -> None:
+def queue_summary(employee_id: int, force: bool = False) -> None:
+    """force=True ignores the input-hash cache (used by the Regenerate button)."""
+    if force:
+        with _lock:
+            _force.add(employee_id)
     queue("summary", employee_id)
 
 _last_check = 0.0

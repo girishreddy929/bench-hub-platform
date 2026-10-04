@@ -27,6 +27,7 @@ FILLER = {
     "resources", "profile", "profiles", "show", "find", "list", "me", "need", "needs", "want",
     "looking", "look", "familiar", "familiarity", "background", "exposure", "ability", "able",
     "using", "use", "used", "about", "related", "like", "similar",
+    "certified", "certification", "certifications", "certificate", "certificates",
 }
 NEGATIVE_RE = re.compile(
     r"\b(bad|weak|weakness(?:es)?|poor|poorly|lacks?|lacking|struggl\w*|worst|"
@@ -136,11 +137,16 @@ def _load_bundle(employees: list) -> dict:
     summaries = db.get_all_summaries()
     feedback = db.get_all_feedback()
     texts = db.get_all_document_texts()
+    certs = db.get_all_certifications()
     bundle = {}
     for employee in employees:
         summary = summaries.get(employee.id)
         doc_texts = texts.get(employee.id, {})
-        sources = indexer.build_sources(summary, feedback.get(employee.id, []), {})
+        sources = indexer.build_sources(
+            summary, feedback.get(employee.id, []), {},
+            designation=employee.designation or (summary or {}).get("designation", ""),
+            certs=certs.get(employee.id, []),
+        )
         skills = indexer.employee_skills(employee, summary)
         bundle[employee.id] = {
             "skills": list(skills),

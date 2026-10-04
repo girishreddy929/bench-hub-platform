@@ -75,7 +75,60 @@ assert summary["organization_summary"] == "second"
 assert summary["top_strengths"] == ["a", "b"]
 assert summary["skills"] == ["python", "sql"]
 
+# Designation: AI fills only an empty one, old callers never wipe it
+assert db.get_employee(eid).designation == ""
+assert db.set_designation_if_empty(eid, "Senior Data Scientist") is True
+assert db.set_designation_if_empty(eid, "Something Else") is False
+db.save_employee("T-1", "Test Person", "test@example.com", "Python, Spark", "Interviewing", employee_id=eid)
+assert db.get_employee(eid).designation == "Senior Data Scientist"  # designation=None keeps it
+db.save_employee("T-1", "Test Person", "test@example.com", "Python, Spark", "Interviewing",
+                 employee_id=eid, designation="Lead")
+assert db.get_employee(eid).designation == "Lead"
+
+# Projects: saved with the summary; projects=None leaves them unchanged
+db.save_summary(eid, "third", ["a"], ["python"], projects=[{"name": "Churn", "technologies": ["python"]}])
+assert db.get_summary(eid)["projects"][0]["name"] == "Churn"
+db.save_summary(eid, "fourth", ["a"], ["python"])
+assert len(db.get_summary(eid)["projects"]) == 1
+
+# Certifications: parse, manual save, AI merge rules
+db.save_manual_certifications(
+    eid, db.parse_certifications("AWS Solutions Architect | Amazon | 2023\n- Azure DP-100")
+)
+certs = db.get_certifications(eid)
+assert [c.name for c in certs] == ["AWS Solutions Architect", "Azure DP-100"]
+assert certs[0].issuer == "Amazon" and certs[0].year == "2023"
+
+db.save_ai_certifications(
+    eid, [{"name": "aws solutions architect"}, {"name": "GCP ML Engineer", "issuer": "Google", "year": "2024"}]
+)
+certs = db.get_certifications(eid)
+assert len(certs) == 3 and {c.source for c in certs} == {"manual", "ai"}
+assert [c.source for c in certs if c.name == "AWS Solutions Architect"] == ["manual"]  # duplicate skipped
+
+db.save_ai_certifications(eid, [])  # a regenerate with no certs removes only the AI ones
+assert len(db.get_certifications(eid)) == 2
+assert db.parse_certifications(db.format_certifications(db.get_certifications(eid)))[0]["issuer"] == "Amazon"
+
+db.save_manual_certifications(eid, [])  # HR's list is the full truth
+assert db.get_certifications(eid) == []
+expect_error(ValueError, db.save_manual_certifications, 9999, [])
+
+db.save_manual_certifications(eid, ["X Cert"])
+assert [c.name for c in db.get_all_certifications()[eid]] == ["X Cert"]
+
+# save_ai_result: one call saves everything, HR's designation and certs survive
+db.save_ai_result(eid, {
+    "designation": "Ignored", "organization_summary": "ai text", "top_strengths": ["s"],
+    "skills": ["sql"], "certifications": [{"name": "Snowflake SnowPro"}], "projects": [{"name": "P1"}],
+})
+assert db.get_employee(eid).designation == "Lead"
+assert db.get_summary(eid)["organization_summary"] == "ai text"
+assert db.get_summary(eid)["projects"][0]["name"] == "P1"
+assert sorted(c.name for c in db.get_certifications(eid)) == ["Snowflake SnowPro", "X Cert"]
+
 print("All database checks passed.")
+
 db.engine.dispose()
 for suffix in ("", "-wal", "-shm"):
     if os.path.exists("test_bench.db" + suffix):

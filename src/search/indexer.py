@@ -40,8 +40,19 @@ def employee_skills(employee, summary) -> dict:
     labels = merge_skills(typed, (summary or {}).get("skills", []))
     return {normalize_skill(s): s for s in labels if normalize_skill(s)}
 
+def _cert_names(certs) -> list:
+    """Certification rows or dicts -> ['AWS Solutions Architect (Amazon)', ...]."""
+    names = []
+    for c in certs or []:
+        name = c.get("name", "") if isinstance(c, dict) else getattr(c, "name", "")
+        issuer = c.get("issuer", "") if isinstance(c, dict) else getattr(c, "issuer", "")
+        if name:
+            names.append(f"{name} ({issuer})" if issuer else name)
+    return names
 
-def build_sources(summary, feedback_list, texts) -> dict:
+
+def build_sources(summary, feedback_list, texts, designation="", certs=None) -> dict:
+
     """{source: [chunk texts]} for one employee. An empty list means 'nothing for this source'.
 
     review  = pros, plus comments from reviews rated 3+.
@@ -49,10 +60,15 @@ def build_sources(summary, feedback_list, texts) -> dict:
     """
     summary = summary or {}
     parts = []
+    if designation:
+        parts.append(f"Designation: {designation}")
     if summary.get("organization_summary"):
         parts.append(summary["organization_summary"])
     if summary.get("top_strengths"):
         parts.append("Strengths: " + "; ".join(summary["top_strengths"]))
+    names = _cert_names(certs)
+    if names:
+        parts.append("Certifications: " + "; ".join(names))
 
     reviews, concerns = [], []
     for f in feedback_list:
@@ -105,7 +121,11 @@ def index_employee(employee_id: int) -> int:
     model = models.get_embed_model()
     summary = db.get_summary(employee_id)
     texts = {t: (d.extracted_text or "") for t, d in db.get_documents(employee_id).items()}
-    sources = build_sources(summary, db.get_feedback(employee_id), texts)
+    sources = build_sources(
+        summary, db.get_feedback(employee_id), texts,
+        designation=employee.designation or (summary or {}).get("designation", ""),
+        certs=db.get_certifications(employee_id),
+    )
     meta = db.get_chunk_meta()
 
     written = 0
@@ -135,11 +155,16 @@ def stale_ids() -> list:
     summaries = db.get_all_summaries()
     feedback = db.get_all_feedback()
     all_texts = db.get_all_document_texts()
+    all_certs = db.get_all_certifications()
 
     stale = []
     for employee in db.get_all_employees():
         summary = summaries.get(employee.id)
-        sources = build_sources(summary, feedback.get(employee.id, []), all_texts.get(employee.id, {}))
+        sources = build_sources(
+            summary, feedback.get(employee.id, []), all_texts.get(employee.id, {}),
+            designation=employee.designation or (summary or {}).get("designation", ""),
+            certs=all_certs.get(employee.id, []),
+        )
         is_stale = False
         for source in db.CHUNK_SOURCES:
             chunks = sources.get(source, [])

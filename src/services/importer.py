@@ -32,6 +32,9 @@ class Draft:
     resume_text: str = ""
     slider_text: str = ""
     summary: Optional[dict] = None
+    designation: str = ""  # job title, editable
+    certs: str = ""  # one "Name | Issuer | Year" per line, editable
+    projects: list = field(default_factory=list)  # from the AI, saved as is
     notes: list = field(default_factory=list)
     exists: bool = False  # Employee ID already in the database
     error: str = ""
@@ -113,12 +116,25 @@ def _read(path: str, notes: list) -> str:
         notes.append(f"No text found in {name} (scanned or image-only file?)")
     return text
 
+def _certs_text(certs: list) -> str:
+    """AI certification dicts -> the editable text form (Name | Issuer | Year per line)."""
+    lines = []
+    for c in certs or []:
+        parts = [c.get("name", ""), c.get("issuer", ""), c.get("year", "")]
+        while parts and not parts[-1]:
+            parts.pop()
+        if parts and parts[0]:
+            lines.append(" | ".join(parts))
+    return "\n".join(lines)
 
 def build_draft(uid: str, slot: dict) -> Draft:
     """Read the files, pull the email, and let the local AI fill summary + skills."""
     d = Draft(uid=uid, code=slot["code"], resume_path=slot["resume"], slider_path=slot["one_slider"])
     d.name = display_name(slot)
-    d.exists = bool(d.code) and db.get_employee_by_code(d.code) is not None
+    known = db.get_employee_by_code(d.code) if d.code else None
+    d.exists = known is not None
+    if known is not None:
+        d.designation = known.designation or ""  # HR's title wins over the AI's
     if d.resume_path:
         d.resume_text = _read(d.resume_path, d.notes)
     if d.slider_path:
@@ -129,6 +145,9 @@ def build_draft(uid: str, slot: dict) -> Draft:
     try:
         d.summary = ai.generate_summary(d.resume_text, d.slider_text, [])
         d.skills = ", ".join(d.summary["skills"])
+        d.designation = d.designation or d.summary.get("designation", "")
+        d.certs = _certs_text(d.summary.get("certifications", []))
+        d.projects = d.summary.get("projects", [])
     except ai.SummaryError as exc:
         d.notes.append(f"AI could not fill the profile: {exc}")
     return d
@@ -151,11 +170,16 @@ def upload_draft(d: Draft) -> tuple[int, bool]:
 
     needs_regen is True for an existing employee: their old feedback and files
     must be part of the new summary, so the caller regenerates it.
+    Certifications HR has reviewed are saved as manual ones (the AI never overwrites them).
     """
     existing = db.get_employee_by_code(d.code)
+    ai_title = (d.summary or {}).get("designation", "")
+    typed = d.designation.strip()
+    hr_title = None if (not typed or typed == ai_title) else typed  # the AI's title is not HR's
     emp_id = db.save_employee(
         d.code, d.name, d.email, d.skills, d.status,
         employee_id=existing.id if existing else None,
+        designation=hr_title,  # None = keep what is stored
     )
     for kind, path, text in (
         ("resume", d.resume_path, d.resume_text),
@@ -164,11 +188,17 @@ def upload_draft(d: Draft) -> tuple[int, bool]:
         if path:
             with open(path, "rb") as fh:
                 db.save_document(emp_id, kind, os.path.basename(path), fh.read(), text)
+    if d.certs.strip():  # an empty box never wipes existing certifications
+        db.save_manual_certifications(emp_id, db.parse_certifications(d.certs))
     if existing is not None:
         return emp_id, True
     if d.summary:
         skills = [s.strip() for s in d.skills.split(",") if s.strip()]  # user-edited
         db.save_summary(
-            emp_id, d.summary["organization_summary"], d.summary["top_strengths"], skills
+            emp_id, d.summary["organization_summary"], d.summary["top_strengths"], skills,
+            projects=d.projects,
+            ai_designation=ai_title,
+            # the "files unchanged" fingerprint is stored only if both AI calls worked
+            input_hash=ai.input_hash(d.resume_text, d.slider_text) if "projects" in d.summary else None,
         )
     return emp_id, False
