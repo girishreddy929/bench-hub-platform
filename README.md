@@ -252,6 +252,7 @@ python -m tests.test_ai_engine    # certification parser, text cleaning, fingerp
 
 
 ### 1.Whole System : 
+```mermaid
 flowchart TB
   classDef plain fill:#e3f2fd,stroke:#1565c0,color:#000;
   classDef llm fill:#ffe0b2,stroke:#e65100,color:#000;
@@ -300,9 +301,10 @@ flowchart TB
   DB --> QP
   QP --> VIEW
   DB --> VIEW
+```
 
 ### 2.Building a profile
-
+```mermaid
   flowchart TB
   classDef plain fill:#e3f2fd,stroke:#1565c0,color:#000;
   classDef llm fill:#ffe0b2,stroke:#e65100,color:#000;
@@ -343,10 +345,10 @@ flowchart TB
   OK --> IDX
   BAD --> IDX
   SKIP --> IDX
-
+```
 
 ### 3.Searching 
-
+```mermaid
 flowchart LR
   classDef plain fill:#e3f2fd,stroke:#1565c0,color:#000;
   classDef emb fill:#e1bee7,stroke:#6a1b9a,color:#000;
@@ -375,9 +377,10 @@ flowchart LR
   CHK -->|no| SKIP
   CHK -->|yes| EMB --> CV
   F -->|only skills without a vector yet| EMB --> SV
+```
 
 ### 4.What happens when someone searches
-
+```mermaid
 flowchart TB
   classDef plain fill:#e3f2fd,stroke:#1565c0,color:#000;
   classDef emb fill:#e1bee7,stroke:#6a1b9a,color:#000;
@@ -425,9 +428,10 @@ flowchart TB
   C --> ST
   NM --> ST
   ST --> MIN --> OUT
+```
 
 ### 5.Where each part of the profile view comes from:
-
+```mermaid
 flowchart LR
   classDef plain fill:#e3f2fd,stroke:#1565c0,color:#000;
   classDef llm fill:#ffe0b2,stroke:#e65100,color:#000;
@@ -467,5 +471,4 @@ flowchart LR
   c2 --> C
   f1 --> R
   d1 --> D
-
-### 6.
+```
