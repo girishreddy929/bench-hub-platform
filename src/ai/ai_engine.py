@@ -15,10 +15,11 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from src.search.skills import merge_skills
 from src.ai import models
+from src.services import timing  # no project imports inside it, so no import cycle
 
 load_dotenv()
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi4-mini")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "6144"))
@@ -348,23 +349,12 @@ def extract_certifications(resume_text: str, one_slider_text: str) -> list[dict]
 # --------------------------------------------------------------------------
 # Talking to the model
 # --------------------------------------------------------------------------
-def _log_timing(label: str, response) -> None:
-    """One line per call. For the second call, a much lower 'prompt' token count means the
-    already-read documents were reused."""
-    def num(name: str) -> float:
-        return float(getattr(response, name, 0) or 0)
 
-    print(
-        f"[ai] {label}: prompt {int(num('prompt_eval_count'))} tokens in "
-        f"{num('prompt_eval_duration') / 1e9:.1f}s, output {int(num('eval_count'))} tokens in "
-        f"{num('eval_duration') / 1e9:.1f}s",
-        flush=True,
-    )
-
-
-def _chat(client: ollama.Client, user_prompt: str, schema: dict, model: str, max_output: int, label: str) -> str:
+def _chat(
+    client: ollama.Client, user_prompt: str, schema: dict, model: str, max_output: int, label: str, attempt: int = 1
+) -> str:
     options = {
-        "temperature": 0.2,
+        "temperature": 0,
         "num_ctx": OLLAMA_NUM_CTX,
         "num_predict": min(OLLAMA_MAX_OUTPUT, max_output),
     }
@@ -388,8 +378,8 @@ def _chat(client: ollama.Client, user_prompt: str, schema: dict, model: str, max
     except (ConnectionError, httpx.ConnectError):
         raise SummaryError("Cannot reach Ollama. Make sure it is running (try: ollama serve).")
     except httpx.TimeoutException:
-        raise SummaryError("The model took too long to respond. Try again, or raise OLLAMA_TIMEOUT.")
-    _log_timing(label, response)
+        raise SummaryError("The model took too long to respond. Try again, or use shorter files.")
+    timing.ai_call(label, response, attempt, OLLAMA_NUM_CTX)
     return response["message"]["content"]
 
 
@@ -397,11 +387,12 @@ def _ask(task: str, schema: dict, max_output: int, label: str, resume_text: str,
     """One model call -> parsed JSON dict. Retries once if the JSON is unusable."""
     prompt = build_prompt(task, resume_text, slider_text)
     client = ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_TIMEOUT)
-    for _attempt in range(2):
-        content = _chat(client, prompt, schema, model, max_output, label)
+    for attempt in (1, 2):
+        content = _chat(client, prompt, schema, model, max_output, label, attempt)
         try:
             data = json.loads(content)
         except json.JSONDecodeError:
+            timing.log(f"  {label}: answer was not valid JSON (attempt {attempt})")
             continue
         if isinstance(data, dict):
             return data
@@ -484,7 +475,7 @@ def generate_summary_part(resume_text: str, one_slider_text: str, model=None) ->
             continue  # already covered by a longer title
         titles = [t for t in titles if t.lower() not in low] + [title]
     designation = " - ".join(titles)
-    print(f"[ai] designation: {designation!r}", flush=True)
+    timing.log(f"  designation: {designation!r}")
     return {
         "designation": designation,
         "organization_summary": overview,
@@ -512,9 +503,10 @@ def generate_summary(resume_text: str, one_slider_text: str, feedback_list=None,
     result = generate_summary_part(resume_text, one_slider_text, model)
     try:
         result["projects"] = generate_projects(resume_text, one_slider_text, model)
-    except SummaryError:
-        pass
-    result["certifications"] = extract_certifications(resume_text, one_slider_text)
+    except SummaryError as exc:
+        timing.log(f"  projects call failed: {exc}")
+    with timing.span("certifications (code)"):
+        result["certifications"] = extract_certifications(resume_text, one_slider_text)
     result["top_strengths"] = []  # the Strengths section is switched off for now
     return result
 

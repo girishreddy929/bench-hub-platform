@@ -114,6 +114,6 @@ def render_footer() -> None:
         return
     st.markdown('<div class="footer-space"></div>', unsafe_allow_html=True)
     try:
-        st.image(BANNER_PATH, use_container_width=True)
+        st.image(BANNER_PATH, width="stretch")
     except TypeError:  # older Streamlit versions
         st.image(BANNER_PATH, use_column_width=True)

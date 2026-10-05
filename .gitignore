@@ -6,3 +6,4 @@ bench.db-shm
 test_bench.db*
 __pycache__/
 *.pyc
+logs/

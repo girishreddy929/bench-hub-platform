@@ -12,6 +12,8 @@ from typing import Optional
 
 import src.ai.ai_engine as ai
 import src.db.database as db
+from src.ai import models
+from src.services import timing
 
 SUPPORTED = {".pdf", ".docx", ".pptx"}
 LEGACY = {".ppt", ".doc"}
@@ -107,8 +109,9 @@ def scan_folder(folder: str):
 def _read(path: str, notes: list) -> str:
     name = os.path.basename(path)
     try:
-        with open(path, "rb") as fh:
-            text = ai.extract_text(name, fh.read())
+        with timing.span(f"read file {name[:40]}"):
+            with open(path, "rb") as fh:
+                text = ai.extract_text(name, fh.read())
     except Exception as exc:
         notes.append(f"Could not read {name}: {exc}")
         return ""
@@ -129,6 +132,11 @@ def _certs_text(certs: list) -> str:
 
 def build_draft(uid: str, slot: dict) -> Draft:
     """Read the files, pull the email, and let the local AI fill summary + skills."""
+    with timing.profile(slot["code"] or uid, "folder_import", model=models.get_summary_model()):
+        return _build_draft(uid, slot)
+
+
+def _build_draft(uid: str, slot: dict) -> Draft:
     d = Draft(uid=uid, code=slot["code"], resume_path=slot["resume"], slider_path=slot["one_slider"])
     d.name = display_name(slot)
     known = db.get_employee_by_code(d.code) if d.code else None
@@ -142,6 +150,7 @@ def build_draft(uid: str, slot: dict) -> Draft:
     else:
         d.notes.append("No one-slider found: using the resume only")
     d.email = find_email(d.resume_text) or find_email(d.slider_text)
+    timing.log(f"  input: resume {len(d.resume_text)} chars, one-slider {len(d.slider_text)} chars")
     try:
         d.summary = ai.generate_summary(d.resume_text, d.slider_text, [])
         d.skills = ", ".join(d.summary["skills"])
@@ -150,6 +159,7 @@ def build_draft(uid: str, slot: dict) -> Draft:
         d.projects = d.summary.get("projects", [])
     except ai.SummaryError as exc:
         d.notes.append(f"AI could not fill the profile: {exc}")
+        timing.set_result(f"AI failed: {str(exc)[:120]}")
     return d
 
 
@@ -166,6 +176,12 @@ def problems(d: Draft) -> list[str]:
 
 
 def upload_draft(d: Draft) -> tuple[int, bool]:
+    """Save a reviewed draft (timed). See _upload_draft."""
+    with timing.profile(d.code or d.uid, "folder_upload"):
+        return _upload_draft(d)
+
+
+def _upload_draft(d: Draft) -> tuple[int, bool]:
     """Save a reviewed draft. Returns (database id, needs_regen).
 
     needs_regen is True for an existing employee: their old feedback and files
@@ -186,8 +202,9 @@ def upload_draft(d: Draft) -> tuple[int, bool]:
         ("one_slider", d.slider_path, d.slider_text),
     ):
         if path:
-            with open(path, "rb") as fh:
-                db.save_document(emp_id, kind, os.path.basename(path), fh.read(), text)
+            with timing.span(f"save {kind} file"):
+                with open(path, "rb") as fh:
+                    db.save_document(emp_id, kind, os.path.basename(path), fh.read(), text)
     if d.certs.strip():  # an empty box never wipes existing certifications
         db.save_manual_certifications(emp_id, db.parse_certifications(d.certs))
     if existing is not None:

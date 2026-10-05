@@ -9,8 +9,8 @@ from src.ai import models
 import src.db.database as db
 from src.search import search as hsearch
 import src.ui.ui_theme as ui_theme
-import streamlit.components.v1 as components
-from src.services import jobs
+
+from src.services import jobs, timing
 from src.ui.import_ui import render_import_section
 from src.search.skills import compact_skill, merge_skills, normalize_skill
 
@@ -86,7 +86,7 @@ def _noop() -> None:
 
 def refresh_summary(employee_id: int) -> bool:
     """Queue a background summary update (used by the folder import for existing employees)."""
-    jobs.queue_summary(employee_id)
+    jobs.queue_summary(employee_id, src="folder_import")
     return True
 
 @st.fragment(run_every=3)
@@ -100,6 +100,50 @@ def job_status() -> None:
         st.info(f"Profiles updating: {len(ids)}")
     if finished:
         st.rerun()        
+
+def _store_files(employee_id, uploads, certs_text, certs_before, code) -> bool:
+    """Extract text, store the uploaded files, read certifications. Timed as one profile (src=upload).
+    Returns True if at least one file was saved."""
+    saved_any = False
+    with timing.profile(code.strip() or employee_id, "upload"):
+        for doc_type, f in uploads:
+            if f is None:
+                continue
+            data = f.getvalue()
+            try:
+                with timing.span(f"read file {f.name[:40]}"):
+                    text = ai.extract_text(f.name, data)
+            except Exception as exc:
+                text = ""
+                flash("warning", f"Could not read {f.name}: {exc}. Stored, but not used for the summary.")
+            else:
+                if not text:
+                    flash("warning", f"No text found in {f.name} (scanned or image-only?). Stored, but not used for the summary.")
+            try:
+                with timing.span(f"save {doc_type} file"):
+                    db.save_document(employee_id, doc_type, f.name, data, text)
+                saved_any = True
+            except ValueError as exc:
+                flash("error", str(exc))
+
+        if saved_any:  # certifications are read by code (no AI), so they appear at once
+            with timing.span("certifications (code)"):
+                stored = db.get_documents(employee_id)
+                db.save_ai_certifications(
+                    employee_id,
+                    ai.extract_certifications(
+                        stored["resume"].extracted_text if "resume" in stored else "",
+                        stored["one_slider"].extracted_text if "one_slider" in stored else "",
+                    ),
+                )
+
+        if certs_text.strip() != certs_before.strip():  # only when HR actually changed the box
+            try:
+                with timing.span("save HR certifications"):
+                    db.save_manual_certifications(employee_id, db.parse_certifications(certs_text))
+            except ValueError as exc:
+                flash("error", str(exc))
+    return saved_any
 
 def handle_employee_save(
     selected_id, code, name, email, skills, status, resume_file, slider_file,
@@ -120,45 +164,12 @@ def handle_employee_save(
         st.error(str(exc))
         return
 
-    saved_any = False
-    for doc_type, f in uploads:
-        if f is None:
-            continue
-        data = f.getvalue()
-        try:
-            text = ai.extract_text(f.name, data)
-        except Exception as exc:
-            text = ""
-            flash("warning", f"Could not read {f.name}: {exc}. Stored, but not used for the summary.")
-        else:
-            if not text:
-                flash("warning", f"No text found in {f.name} (scanned or image-only?). Stored, but not used for the summary.")
-        try:
-            db.save_document(employee_id, doc_type, f.name, data, text)
-            saved_any = True
-        except ValueError as exc:
-            flash("error", str(exc))
-
-    if saved_any:  # certifications are read by code (no AI), so they appear at once
-        stored = db.get_documents(employee_id)
-        db.save_ai_certifications(
-            employee_id,
-            ai.extract_certifications(
-                stored["resume"].extracted_text if "resume" in stored else "",
-                stored["one_slider"].extracted_text if "one_slider" in stored else "",
-            ),
-        )
-
-    if certs_text.strip() != certs_before.strip():  # only when HR actually changed the box
-        try:
-            db.save_manual_certifications(employee_id, db.parse_certifications(certs_text))
-        except ValueError as exc:
-            flash("error", str(exc))
+    saved_any = _store_files(employee_id, uploads, certs_text, certs_before, code)
 
     flash("success", f"Saved {name.strip()} (ID {code.strip()}).")
-    jobs.queue("embed", employee_id)  # skill or status edits become searchable right away
+    jobs.queue("embed", employee_id, src="save")  # skill or status edits become searchable right away
     if saved_any:
-        jobs.queue_summary(employee_id)
+        jobs.queue_summary(employee_id, src="upload")
         flash("info", "Summary is updating in the background.")
     st.session_state["pending_admin_select"] = employee_id
     st.session_state["nonce"] += 1
@@ -175,7 +186,7 @@ def handle_feedback_submit(employee_id, manager, project, rating, pros, cons, co
         "success",
         "Replaced this manager's earlier review for the same project." if replaced else "Feedback saved.",
     )
-    jobs.queue("embed", employee_id)  # reviews are searchable; the AI summary does not use them
+    jobs.queue("embed", employee_id, src="review")  # reviews are searchable; the AI summary does not use them
     st.session_state["nonce"] += 1
     st.rerun()
 
@@ -312,8 +323,9 @@ with tab_admin:
         if st.button("Regenerate all summaries", key="regen_all", disabled=not sure):
             doc_texts = db.get_all_document_texts()
             targets = [e for e in employees if doc_texts.get(e.id)]
+            timing.log(f"REGENERATE ALL clicked: {len(targets)} profiles queued")
             for e in targets:
-                jobs.queue_summary(e.id)
+                jobs.queue_summary(e.id, src="regenerate_all")
             flash("info", f"Queued {len(targets)} summaries. Watch 'Profiles updating' in the sidebar.")
             st.rerun()
 
@@ -388,11 +400,11 @@ def render_details(emp) -> None:
 
     im_col, mail_col, _ = st.columns([1, 1, 5])
     if can_contact(emp):
-        im_col.link_button("Send IM", teams_link(emp), use_container_width=True)
-        mail_col.link_button("Send Mail", mail_link(emp), use_container_width=True)
+        im_col.link_button("Send IM", teams_link(emp), width="stretch")
+        mail_col.link_button("Send Mail", mail_link(emp), width="stretch")
     else:
-        im_col.button("Send IM", key=f"im_{emp.id}", on_click=_noop, use_container_width=True)
-        mail_col.button("Send Mail", key=f"mail_{emp.id}", on_click=_noop, use_container_width=True)
+        im_col.button("Send IM", key=f"im_{emp.id}", on_click=_noop, width="stretch")
+        mail_col.button("Send Mail", key=f"mail_{emp.id}", on_click=_noop, width="stretch")
 
     busy = emp.id in jobs.pending_ids()
     failure = jobs.error_for(emp.id)
@@ -461,7 +473,7 @@ def render_details(emp) -> None:
         st.caption("No projects found. They appear after the summary is (re)generated from a one-slider or resume.")
 
     if st.button("Regenerate summary", key=f"regen_{emp.id}", disabled=busy):
-        jobs.queue_summary(emp.id, force=True)  # ignores the "files unchanged" shortcut
+        jobs.queue_summary(emp.id, force=True, src="regenerate")  # ignores the "files unchanged" shortcut
         st.rerun()
 
     st.markdown("#### Manager Review")
@@ -538,7 +550,8 @@ with tab_dash:
         candidates = [e for e in all_employees if allowed(e)]
         hit_by_id = {}
         if query:
-            outcome = hsearch.run_search(query, candidates)
+            with timing.span("search: total"):
+                outcome = hsearch.run_search(query, candidates)
             for note in outcome.notes:
                 st.warning(note)
             if outcome.concern_mode:
@@ -578,6 +591,6 @@ with tab_dash:
         if chosen:
             render_details(chosen)
             if st.session_state.pop("scroll_to_profile", False):
-                components.html(SCROLL_JS, height=0)
+                st.iframe(SCROLL_JS.strip(), height=1)
         
 ui_theme.render_footer()

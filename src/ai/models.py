@@ -9,14 +9,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-DEFAULT_SUMMARY = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+DEFAULT_SUMMARY = os.getenv("OLLAMA_MODEL", "phi4-mini")
 DEFAULT_EMBED = os.getenv("EMBED_MODEL", "qwen3-embedding:0.6b")
 
 # name -> label shown in the dropdown
 SUMMARY_MODELS = {
-    "qwen2.5:7b": "Qwen 2.5 7B (default, best balance)",
-    "llama3.1:8b": "Llama 3.1 8B (alternative)",
+    "phi4-mini": "Phi-4 mini 3.8B (default, fast)",
     "qwen2.5:3b": "Qwen 2.5 3B (faster, lighter)",
+    "qwen2.5:7b": "Qwen 2.5 7B (slower, compare quality)",
+    "llama3.1:8b": "Llama 3.1 8B (alternative)",
 }
 
 # name -> label + prefixes. Each embedding model expects its own prefix format.

@@ -9,6 +9,7 @@ from src.ai import models
 from src.db import database as db
 from src.search import indexer
 from src.search.skills import compact_skill, normalize_skill
+from src.services import timing
 
 POSITIVE_SOURCES = ["review", "summary", "one_slider", "resume"]
 
@@ -209,6 +210,34 @@ def _combine(scores: list) -> float:
         return scores[0]
     return 0.75 * (sum(scores) / len(scores)) + 0.25 * min(scores)
 
+def _explain(concept, skill_sims, chunk_sims, anchors, labels) -> None:
+    """Timing log only: raw similarity statistics, used to tune the star anchors. Changes no result."""
+    if not timing.enabled():
+        return
+
+    def stats(values) -> str:
+        values = sorted(values)
+        if not values:
+            return "no values"
+        pick = lambda q: values[min(len(values) - 1, int(q * len(values)))]
+        return f"min {values[0]:.2f} | median {pick(0.5):.2f} | p90 {pick(0.9):.2f} | max {values[-1]:.2f}"
+
+    timing.log(
+        f"  SEARCH '{concept}'  anchors: skill {anchors['skill_floor']}-{anchors['skill_ceiling']}, "
+        f"chunk {anchors['chunk_floor']}-{anchors['chunk_ceiling']}"
+    )
+    if skill_sims:
+        top = sorted(skill_sims.items(), key=lambda kv: -kv[1])[:5]
+        timing.log(f"    skills      {stats(skill_sims.values())}")
+        timing.log("      top skills: " + ", ".join(f"{k} {v:.2f}" for k, v in top))
+    by_source = {}
+    for emp_id, per_source in chunk_sims.items():
+        for source, value in per_source.items():
+            by_source.setdefault(source, []).append((value, emp_id))
+    for source, pairs in by_source.items():
+        timing.log(f"    {source:<11} {stats([v for v, _ in pairs])}")
+        best = sorted(pairs, reverse=True)[:3]
+        timing.log("      top: " + ", ".join(f"{labels.get(e, e)} {v:.2f}" for v, e in best))
 
 def run_search(query: str, employees: list) -> Outcome:
     """Rank employees for a free-text query. Hits are sorted by score, best first."""
@@ -216,16 +245,20 @@ def run_search(query: str, employees: list) -> Outcome:
     if not (query or "").strip() or not employees:
         return outcome
 
-    bundle = _load_bundle(employees)
+    with timing.span("search: load data"):
+        bundle = _load_bundle(employees)
     vocab = {key for info in bundle.values() for key in info["skills"]}
     outcome.concern_mode, outcome.concepts = parse_query(query, vocab)
     if not outcome.concepts:
         return outcome
 
     model = models.get_embed_model()
+    labels = {e.id: e.name for e in employees}
     per_concept = []
     for concept in outcome.concepts:
-        skill_sims, chunk_sims, anchors = _semantic(concept, model, outcome.concern_mode, outcome.notes)
+        with timing.span(f"search: vectors '{concept}'"):
+            skill_sims, chunk_sims, anchors = _semantic(concept, model, outcome.concern_mode, outcome.notes)
+        _explain(concept, skill_sims, chunk_sims, anchors, labels)
         per_concept.append((concept, _keyword_regex(concept), skill_sims, chunk_sims, anchors))
 
     direct = compact_skill(query)
@@ -253,4 +286,9 @@ def run_search(query: str, employees: list) -> Outcome:
     names = {e.id: e.name.lower() for e in employees}
     hits.sort(key=lambda h: (-h.score, names[h.employee_id]))
     outcome.hits = hits
+    if timing.enabled():
+        timing.log(
+            "  SEARCH result: "
+            + ", ".join(f"{labels[h.employee_id]} {h.score}pt {h.stars}stars" for h in hits[:8])
+        )
     return outcome

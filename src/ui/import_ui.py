@@ -7,6 +7,7 @@ import streamlit as st
 
 import src.db.database as db
 import src.services.importer as imp
+from src.services import jobs, timing
 
 
 # ---------------------------- state helpers -------------------------------
@@ -19,7 +20,7 @@ def _find(uid):
 
 
 def _clear_edit_keys(uid) -> None:
-    for name in ("code", "name", "email", "skills", "status"):
+    for name in ("code", "name", "email", "skills", "status", "designation", "certs"):
         st.session_state.pop(f"ed_{name}_{uid}", None)
 
 
@@ -134,19 +135,20 @@ def review_dialog(refresh_summary):
         bar = st.progress(0.0)
         scan = st.session_state.get("scan")
         done = failed = 0
-        for i, d in enumerate(ready, 1):
-            try:
-                emp_id, regen = imp.upload_draft(d)
-                if regen:
-                    refresh_summary(emp_id)
-                drafts.remove(d)
-                if scan:
-                    scan["groups"].pop(d.uid, None)  # uploaded rows leave the scan table
-                done += 1
-            except (ValueError, OSError) as exc:
-                d.error = str(exc)
-                failed += 1
-            bar.progress(i / len(ready))
+        with timing.span(f"IMPORT UPLOAD {len(ready)} profiles"):
+            for i, d in enumerate(ready, 1):
+                try:
+                    emp_id, regen = imp.upload_draft(d)
+                    if regen:
+                        refresh_summary(emp_id)
+                    drafts.remove(d)
+                    if scan:
+                        scan["groups"].pop(d.uid, None)  # uploaded rows leave the scan table
+                    done += 1
+                except (ValueError, OSError) as exc:
+                    d.error = str(exc)
+                    failed += 1
+                bar.progress(i / len(ready))
 
         if scan is not None:
             if scan["groups"]:
@@ -162,6 +164,19 @@ def review_dialog(refresh_summary):
 
 
 # ------------------------------ page section ------------------------------
+
+@st.fragment(run_every=3)
+def _read_progress() -> None:
+    """Shows background reading progress; re-runs the page once when a profile finishes."""
+    counts = jobs.read_counts()
+    waiting = counts["queued"] + counts["running"]
+    if waiting:
+        st.info(f"Reading profiles with AI: {waiting} left, {counts['done']} ready. You can keep working.")
+    finished = counts["done"] + counts["failed"]
+    if finished != st.session_state.get("reads_finished_seen", 0):
+        st.session_state["reads_finished_seen"] = finished
+        st.rerun()
+        
 def render_import_section(refresh_summary) -> None:
     st.subheader("Import profiles from a folder")
     st.caption(
@@ -208,22 +223,34 @@ def render_import_section(refresh_summary) -> None:
                 ]
             )
             edited = st.data_editor(
-                table, hide_index=True, use_container_width=True,
+                table, hide_index=True, width="stretch",
                 disabled=[c for c in table.columns if c != "Select"],
                 key=f"imp_table_{select_all}_{st.session_state.get('scan_nonce', 0)}",
             )
             chosen = [keys[i] for i in edited.index[edited["Select"].to_numpy()]]
             if st.button(f"Read {len(chosen)} selected profile(s) with AI", type="primary",
                          disabled=not chosen, key="read_btn"):
-                drafts = []
-                bar = st.progress(0.0)
-                for i, key in enumerate(chosen, 1):
-                    bar.progress((i - 1) / len(chosen), text=f"Reading profile {i} of {len(chosen)}: AI is filling it in...")
-                    drafts.append(imp.build_draft(key, groups[key]))
-                bar.empty()
-                st.session_state["drafts"] = drafts
-                st.session_state["editing"] = None
-                review_dialog(refresh_summary)
+                started = sum(1 for key in chosen if jobs.queue_read(key, groups[key]))
+                skipped = len(chosen) - started
+                st.session_state.setdefault("flash", []).append(
+                    (
+                        "info",
+                        f"Reading {started} profile(s) in the background."
+                        + (f" {skipped} already queued or waiting for review." if skipped else ""),
+                    )
+                )
+                st.rerun()
 
+    _read_progress()
+    counts = jobs.read_counts()
+    if counts["done"] or counts["failed"]:
+        if st.button(f"Review {counts['done']} read profile(s)", type="primary", key="review_btn"):
+            new, failed = jobs.take_reads()
+            have = {d.uid for d in _drafts()}
+            st.session_state["drafts"] = _drafts() + [d for d in new if d.uid not in have]
+            st.session_state["editing"] = None
+            for uid, message in failed.items():
+                st.error(f"Could not read {uid}: {message}")
+            review_dialog(refresh_summary)
     if st.session_state.get("drafts") and st.button("Reopen review window", key="reopen_btn"):
         review_dialog(refresh_summary)
