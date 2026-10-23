@@ -1,4 +1,4 @@
-# Tredence Bench Hub
+# Bench Hub platform
 
 An internal tool for bench staffing. HR uploads or imports profiles (resume + one-slider). A **local** AI model
 writes each profile (title, summary, skills, projects). Managers add project reviews. Project managers search
@@ -40,7 +40,7 @@ Tests (no Ollama needed):
 | `EMBED_MODEL` | `qwen3-embedding:0.6b` | Search model |
 | `EMBED_TIMEOUT`, `EMBED_MAX_CHARS`, `EMBED_BATCH` | `60`, `6000`, `16` | Embedding limits |
 | `IMPORT_FOLDER` | empty | Default folder for the folder import |
-| `CONTACT_ALLOWED_DOMAIN` | `tredence.com` | Contact buttons work only for this domain |
+| `CONTACT_ALLOWED_DOMAIN` | `domain.com` | Contact buttons work only for this domain |
 | `TIMING_LOG` | `0` | `1` prints timing lines (see section 6) |
 | `TIMING_LOG_FILE` | empty | Optional file, e.g. `logs/timing.log` |
 
